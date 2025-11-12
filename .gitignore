@@ -1,0 +1,59 @@
+# 🔒 Variáveis de ambiente
+.env
+.env.*
+
+# 🐍 Arquivos Python compilados
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 📦 Dependências e virtualenv
+venv/
+.env/
+.venv/
+env/
+ENV/
+pip-wheel-metadata/
+*.egg-info/
+*.egg
+
+# 🧪 Testes e logs
+.coverage
+.pytest_cache/
+htmlcov/
+nosetests.xml
+coverage.xml
+*.log
+
+# 🗂️ IDEs e editores
+.vscode/
+.idea/
+*.swp
+
+# 📊 Dados temporários
+*.csv
+*.tsv
+*.pkl
+*.pickle
+*.db
+*.sqlite
+*.sqlite3
+
+# 📁 Cache e temporários
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+
+# 🚀 Deploy / OCI / AWS
+*.json
+*.yaml
+*.yml
+runtime.yaml
+oci_config/
+aws_config/
+credentials/
+
+# 📚 Jupyter e Streamlit
+.ipynb_checkpoints/
+.streamlit/secrets.toml
