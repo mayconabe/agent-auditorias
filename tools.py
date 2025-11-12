@@ -60,19 +60,57 @@ def _normalize_from_dados(sql: str) -> str:
     out = out.replace('from dados', 'FROM dados')
     return out
 
+def _create_stable_view():
+    """
+    Cria/recria a VIEW 'dados' com casts estáveis para evitar rebind/binder errors.
+    Ajuste a lista de colunas conforme seu Parquet (incluí as mais usadas aqui).
+    """
+    con.execute(f"""
+        CREATE OR REPLACE VIEW dados AS
+        SELECT
+            * REPLACE (
+                CAST(data_atendimento      AS TIMESTAMP) AS data_atendimento,
+                CAST(data_emissao_guia     AS TIMESTAMP) AS data_emissao_guia,
+                CAST(idade                 AS INTEGER)   AS idade,
+                CAST(descricao_especialidade_medica AS VARCHAR) AS descricao_especialidade_medica,
+                CAST(TIPO_PRESTADOR        AS VARCHAR)   AS TIPO_PRESTADOR,
+                CAST(prestador_uf          AS VARCHAR)   AS prestador_uf
+            )
+        FROM read_parquet('{PARQUET_FILE}')
+    """)
+    logging.info("View 'dados' (estável) criada com casts.")
+
+# chame na inicialização
+try:
+    _create_stable_view()
+except Exception as e:
+    logging.error(f'Falha ao criar VIEW estável do DuckDB: {e}')
+
 
 def _run_query(sql: str) -> str:
     """
     Executa a query no DuckDB e retorna JSON.
+    Se detectar o binder error da view, recria a view e tenta 1x novamente.
     """
-    try:
-        sql = _normalize_from_dados(sql)
-        logging.info(f'[Especialista] Executando query DuckDB: {sql}')
-        result = con.execute(sql).fetchall()
-        return json.dumps(result)
-    except Exception as e:
-        logging.error(f'Erro na query DuckDB: {e}')
-        return json.dumps({'error': str(e)})
+    sql = _normalize_from_dados(sql)
+    for attempt in (1, 2):  # 1ª tentativa + 1 retry
+        try:
+            logging.info(f'[Especialista] Executando query DuckDB (tentativa {attempt}): {sql}')
+            result = con.execute(sql).fetchall()
+            return json.dumps(result)
+        except Exception as e:
+            msg = str(e)
+            logging.error(f'Erro na query DuckDB: {msg}')
+            if attempt == 1 and 'Contents of view were altered' in msg:
+                logging.warning('Detectado binder error; recriando a VIEW dados e tentando novamente...')
+                try:
+                    _create_stable_view()
+                    continue  # tenta de novo
+                except Exception as ee:
+                    logging.error(f'Erro ao recriar VIEW: {ee}')
+            # se não era o binder error, ou já tentamos o retry, retorna erro
+            return json.dumps({'error': msg})
+
 
 
 # =========================================
