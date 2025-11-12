@@ -516,7 +516,6 @@ def _get_metrics_logic(metric: str, period: dict | None = None, top_n: int = 5, 
         return _run_query(sql)
 
     if metric == 'ranking_tipo_atendimento':
-        # Troque TIPO_PRESTADOR por INDICACAO_ACIDENTE se desejar esse conceito.
         sql = f"""
         {cte}
         SELECT COALESCE(TIPO_PRESTADOR, 'Não informado') AS tipo_atendimento,
@@ -528,8 +527,20 @@ def _get_metrics_logic(metric: str, period: dict | None = None, top_n: int = 5, 
         LIMIT {int(top_n)}
         """
         return _run_query(sql)
+    
+    if metric == 'consultas_por_uf':
+        sql = f"""
+        {cte}
+        SELECT
+            COALESCE(NULLIF(TRIM(prestador_uf), ''), 'SEM_UF') AS prestador_uf,
+            COUNT(*) AS consultas
+        FROM dados{from_suffix}
+        WHERE {where_period}
+        GROUP BY 1
+        ORDER BY consultas DESC, prestador_uf ASC
+        """
+        return _run_query(sql)
 
-    # ---- Nova métrica: ranking de especialidades por sexo (top_n por sexo)
     if metric == 'ranking_especialidades_por_sexo':
         filtro_sexo = '' if include_na else 'AND sexo IS NOT NULL'
         sql = f"""
