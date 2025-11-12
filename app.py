@@ -173,66 +173,138 @@ REGRAS DE ORQUESTRAÇÃO:
 if 'messages' not in st.session_state:
     st.session_state.messages = [{'role': 'system', 'content': SYSTEM_INSTRUCTIONS}]
 
-# Render do histórico (sem o system)
-for message in st.session_state.messages:
-    if message['role'] != 'system':
-        with st.chat_message(message['role']):
-            st.markdown(message.get('content', ''))
+if 'show_suggestions' not in st.session_state:
+    # mostra sugestões só se ainda não houve mensagem do usuário
+    st.session_state.show_suggestions = not any(m.get('role') == 'user' for m in st.session_state.messages)
+
+# Flags de controle (uma única vez)
+st.session_state.setdefault('is_processing', False)   # trava input durante execução
+st.session_state.setdefault('pending_prompt', None)   # buffer para clique/digitação
 
 # =========================
 # Utilitário para exibir resultados
 # =========================
 def _render_tool_result_as_markdown(content: str):
     """
-    content é JSON (string) retornado pela função Python da tool.
-    Exibe de maneira amigável.
+    Exibe o resultado da tool de forma amigável.
+    Ignora JSONs brutos e mensagens de depuração.
     """
+    if not content or content.strip() in ('None', '[]', '{}'):
+        return
+
     try:
         data = json.loads(content)
     except Exception:
+        # se não for JSON, só mostra texto
+        if not any(s in content for s in ['rows', 'value', 'error']):
+            st.markdown(content)
+        return
+
+    # se veio {"error": "..."}
+    if isinstance(data, dict) and 'error' in data:
+        st.error(data['error'])
+        return
+
+    # se veio {"value": x}
+    if isinstance(data, dict) and 'value' in data:
+        st.info(f"Resultado numérico: **{round(data['value'], 2)}**")
+        return
+
+    # se veio {"rows": [...]} e não tem 'value'
+    if isinstance(data, dict) and 'rows' in data:
+        rows = data['rows']
+        if not rows:
+            st.info('Sem dados disponíveis.')
+        elif len(rows) == 1 and len(rows[0]) == 1:
+            st.info(f"Resultado: **{rows[0][0]}**")
+        else:
+            st.dataframe(rows)
+        return
+
+    # fallback genérico
+    st.json(data)
+
+# =========================
+# Estado inicial
+# =========================
+if 'messages' not in st.session_state:
+    st.session_state.messages = [{'role': 'system', 'content': SYSTEM_INSTRUCTIONS}]
+
+# controla UI
+if 'show_suggestions' not in st.session_state:
+    st.session_state.show_suggestions = True      # some após 1ª interação
+if 'is_processing' not in st.session_state:
+    st.session_state.is_processing = False        # travar input durante execução
+if 'pending_prompt' not in st.session_state:
+    st.session_state.pending_prompt = None        # buffer de clique/digitação
+
+# =========================
+# Input SEMPRE visível (desabilita durante processamento)
+# =========================
+user_typed = st.chat_input(
+    'Qual sua pergunta sobre os dados?',
+    key='chat_box',
+    disabled=st.session_state.is_processing
+)
+
+if user_typed and not st.session_state.is_processing:
+    st.session_state.pending_prompt = user_typed
+    st.session_state.show_suggestions = False
+    st.session_state.is_processing = True
+    st.rerun()
+
+st.subheader('Sugestões rápidas')
+cols = st.columns(5)
+COMMON_QUESTIONS = [
+    'Quantas consultas foram feitas hoje?',
+    'Qual foi a média de consultas nesse mês?',
+    'Qual é o ranking de especialidades no mês anterior?',
+    'Qual a média de idade nos últimos 3 meses?',
+    'Top 5 especialidades médicas por sexo no mês anterior'
+]
+
+if st.session_state.show_suggestions:
+    for i, q in enumerate(COMMON_QUESTIONS):
+        if cols[i].button(q, use_container_width=True, key=f'quick_q_{i}'):
+            # NÃO adiciona no histórico aqui para não duplicar
+            st.session_state.pending_prompt = q
+            st.session_state.show_suggestions = False
+            st.session_state.is_processing = True
+            st.rerun()
+
+# =========================
+# Render do histórico (sem o system e sem tools)
+# =========================
+for message in st.session_state.messages:
+    role = message.get('role')
+    content = message.get('content')
+
+    # Não exibe mensagens do sistema nem das tools, nem vazias/None
+    if role in ('system', 'tool'):
+        continue
+    if content is None or str(content).strip().lower() == 'none' or str(content).strip() == '':
+        continue
+
+    with st.chat_message(role):
         st.markdown(content)
-        return
-
-    # Casos comuns
-    if isinstance(data, dict):
-        # tente formatos conhecidos
-        if 'rows' in data and isinstance(data['rows'], list):
-            if not data['rows']:
-                st.info('Sem dados.')
-                return
-            # Exibir como tabela simples
-            st.write(data['rows'])
-            return
-        # Caso dicionário simples, formata chave/valor
-        st.json(data)
-        return
-
-    if isinstance(data, list):
-        if not data:
-            st.info('Sem dados.')
-            return
-        st.write(data)
-        return
-
-    st.write(data)
 
 # =========================
-# Loop principal de chat
+# Processamento
 # =========================
-if prompt := st.chat_input('Qual sua pergunta sobre os dados?'):
-    # 1) Guarda pergunta
+if st.session_state.is_processing and st.session_state.pending_prompt is not None:
+    prompt = st.session_state.pending_prompt
+
+    # Adiciona a mensagem do usuário UMA única vez aqui
     st.session_state.messages.append({'role': 'user', 'content': prompt})
-    with st.chat_message('user'):
-        st.markdown(prompt)
 
-    # 2) Execução
     with st.chat_message('assistant'):
         with st.status('Analisando... 🧠', expanded=True) as status:
             try:
+                st.empty()
                 while True:
                     status.update(label='Avaliando a melhor ferramenta... 💡')
 
-                    # Prepara histórico
+                    # monta o histórico para envio
                     messages_to_send = []
                     for msg in st.session_state.messages:
                         if isinstance(msg, dict):
@@ -240,56 +312,56 @@ if prompt := st.chat_input('Qual sua pergunta sobre os dados?'):
                         elif hasattr(msg, 'model_dump'):
                             messages_to_send.append(msg.model_dump())
 
-                    # Chamada ao modelo
                     response = client.chat.completions.create(
-                        model='gpt-5-mini',
+                        model='gpt-4o',
                         messages=messages_to_send,
                         tools=TOOL_SCHEMAS,
                         tool_choice='auto'
                     )
                     response_message = response.choices[0].message
 
-                    # 3) Se houver chamadas de ferramenta
                     if response_message.tool_calls:
                         status.update(label='Consultando os dados... 📊')
-
-                        # Salva a "mensagem assistant" com tool_calls no histórico
+                        # adiciona a "mensagem de ferramenta" do modelo no histórico
                         st.session_state.messages.append(response_message.model_dump())
 
-                        # Para cada tool-call
+                        # executa as tools
                         for tool_call in response_message.tool_calls:
                             function_name = tool_call.function.name
                             function_args_json = tool_call.function.arguments
-
                             st.write(f'🛠️ Chamando: `{function_name}({function_args_json})`')
 
                             if function_name not in available_tools:
-                                logging.error(f'LLM tentou chamar ferramenta desconhecida: {function_name}')
                                 function_response = json.dumps({'error': f'Ferramenta desconhecida: {function_name}'})
                             else:
-                                func = available_tools[function_name]
                                 try:
-                                    function_response = func(function_args_json)
+                                    function_response = available_tools[function_name](function_args_json)
                                 except Exception as tool_e:
-                                    logging.error(f'Erro ao executar ferramenta {function_name}: {tool_e}')
                                     function_response = json.dumps({'error': f'Erro ao executar a ferramenta: {tool_e}'})
 
-                            # Adiciona a resposta da tool ao histórico
-                            st.session_state.messages.append({
-                                'tool_call_id': tool_call.id,
-                                'role': 'tool',
-                                'name': function_name,
-                                'content': function_response
-                            })
+                                # registra a resposta da tool no histórico (para a LLM usar)
+                                st.session_state.messages.append({
+                                    'tool_call_id': tool_call.id,
+                                    'role': 'tool',
+                                    'name': function_name,
+                                    'content': function_response
+                                })
 
-                        # Continua o loop para permitir que o modelo use o resultado das tools
+                                # 🧹 NÃO exibir o JSON bruto; apenas em modo debug, se quiser
+                                if st.session_state.get('debug'):
+                                    st.caption(f'🔍 Retorno da tool {function_name}:')
+                                    st.json(json.loads(function_response))
+
+                        # volta ao topo do while para o modelo consumir as tool responses
                         continue
 
-                    # 4) Sem tool_calls: resposta final
+                    # resposta final
                     status.update(label='Resposta recebida!', state='complete')
                     final_answer = response_message.content or ''
-                    st.markdown(final_answer)
-                    st.session_state.messages.append({'role': 'assistant', 'content': final_answer})
+
+                    if final_answer and final_answer.strip().lower() != 'none':
+                        st.markdown(final_answer)
+                        st.session_state.messages.append({'role': 'assistant', 'content': final_answer})
                     break
 
             except Exception as e:
@@ -297,3 +369,8 @@ if prompt := st.chat_input('Qual sua pergunta sobre os dados?'):
                     status.update(label=f'Ocorreu um erro: {e}', state='error')
                 logging.error(f'Erro no loop de chat: {e}', exc_info=True)
                 st.error(f'Ocorreu um erro: {e}')
+
+    # **Limpa flags** para voltar o input e evitar reprocesso/duplicação
+    st.session_state.pending_prompt = None
+    st.session_state.is_processing = False
+    st.rerun()

@@ -5,6 +5,7 @@ import json
 import logging
 import streamlit as st
 from openai import OpenAI
+from typing import Any, Dict, List
 
 # =========================================
 # Configuração básica
@@ -60,25 +61,96 @@ def _normalize_from_dados(sql: str) -> str:
     out = out.replace('from dados', 'FROM dados')
     return out
 
-def _create_stable_view():
+import logging
+import duckdb
+from typing import Any
+
+def _source_cols(parquet_path: str) -> list[str]:
+    # Lê apenas o schema (0 linhas) e devolve colunas em minúsculas
+    df = con.execute("SELECT * FROM read_parquet(?) LIMIT 0", [parquet_path]).fetchdf()
+    return [c.lower() for c in df.columns]
+
+def _replace_or_add(sql_base: str, want_col: str, expr_if_exists: str, expr_if_missing: str) -> str:
     """
-    Cria/recria a VIEW 'dados' com casts estáveis para evitar rebind/binder errors.
-    Ajuste a lista de colunas conforme seu Parquet (incluí as mais usadas aqui).
+    Se 'want_col' existe no sql_base => SELECT * REPLACE (expr_if_exists AS want_col) FROM (sql_base)
+    Senão                           => SELECT *, expr_if_missing AS want_col FROM (sql_base)
     """
-    con.execute(f"""
-        CREATE OR REPLACE VIEW dados AS
-        SELECT
-            * REPLACE (
-                CAST(data_atendimento      AS TIMESTAMP) AS data_atendimento,
-                CAST(data_emissao_guia     AS TIMESTAMP) AS data_emissao_guia,
-                CAST(idade                 AS INTEGER)   AS idade,
-                CAST(descricao_especialidade_medica AS VARCHAR) AS descricao_especialidade_medica,
-                CAST(TIPO_PRESTADOR        AS VARCHAR)   AS TIPO_PRESTADOR,
-                CAST(prestador_uf          AS VARCHAR)   AS prestador_uf
-            )
-        FROM read_parquet('{PARQUET_FILE}')
-    """)
-    logging.info("View 'dados' (estável) criada com casts.")
+    cols = _source_cols_from_sql(sql_base)
+    if want_col.lower() in cols:
+        return f"SELECT * REPLACE ({expr_if_exists} AS {want_col}) FROM ({sql_base}) t"
+    else:
+        return f"SELECT *, {expr_if_missing} AS {want_col} FROM ({sql_base}) t"
+
+def _source_cols_from_sql(sql_base: str) -> list[str]:
+    # Inspeciona colunas de uma sub-query sem materializar dados
+    df = con.execute(f"SELECT * FROM ({sql_base}) _t LIMIT 0").fetchdf()
+    return [c.lower() for c in df.columns]
+
+def _create_stable_view() -> None:
+    """
+    Cria/recria a VIEW 'dados' garantindo que colunas-alvo existam
+    e/ou sejam normalizadas sem Binder Error.
+    """
+    try:
+        base = "SELECT * FROM read_parquet(?)"
+        # começamos com a fonte parametrizada
+        sql = base.replace('?', f"'{PARQUET_FILE}'")  # se preferir: con.execute com params no final
+
+        # ---- Normalizações/garantias de colunas ----
+        # data_atendimento: TIMESTAMP (se faltar, NULL::TIMESTAMP)
+        sql = _replace_or_add(
+            sql,
+            'data_atendimento',
+            "TRY_CAST(data_atendimento AS TIMESTAMP)",
+            "CAST(NULL AS TIMESTAMP)"
+        )
+
+        # data_emissao_guia: TIMESTAMP (se faltar, use data_atendimento como fallback)
+        sql = _replace_or_add(
+            sql,
+            'data_emissao_guia',
+            "TRY_CAST(data_emissao_guia AS TIMESTAMP)",
+            "TRY_CAST(data_atendimento AS TIMESTAMP)"
+        )
+
+        # idade: INTEGER (se faltar, NULL)
+        sql = _replace_or_add(
+            sql,
+            'idade',
+            "TRY_CAST(idade AS INTEGER)",
+            "CAST(NULL AS INTEGER)"
+        )
+
+        # descricao_especialidade_medica: VARCHAR (se faltar, 'Sem descrição')
+        sql = _replace_or_add(
+            sql,
+            'descricao_especialidade_medica',
+            "CAST(descricao_especialidade_medica AS VARCHAR)",
+            "CAST('Sem descrição' AS VARCHAR)"
+        )
+
+        # tipo_prestador: VARCHAR (note: em DuckDB nomes sem aspas são case-insensitive)
+        sql = _replace_or_add(
+            sql,
+            'tipo_prestador',
+            "CAST(tipo_prestador AS VARCHAR)",
+            "CAST(NULL AS VARCHAR)"
+        )
+
+        # prestador_uf: VARCHAR (se faltar, 'SEM_UF')
+        sql = _replace_or_add(
+            sql,
+            'prestador_uf',
+            "CAST(prestador_uf AS VARCHAR)",
+            "CAST('SEM_UF' AS VARCHAR)"
+        )
+
+        # ---- Cria a view final ----
+        con.execute(f"CREATE OR REPLACE VIEW dados AS {sql}")
+        logging.info("View 'dados' criada/atualizada com sucesso.")
+    except Exception as e:
+        logging.exception("Falha ao criar VIEW estável do DuckDB")
+        raise
 
 # chame na inicialização
 try:
@@ -86,18 +158,34 @@ try:
 except Exception as e:
     logging.error(f'Falha ao criar VIEW estável do DuckDB: {e}')
 
+def _to_scalar(rows: List[List[Any]]):
+    try:
+        if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], (list, tuple)) and len(rows[0]) == 1:
+            return rows[0][0]
+    except Exception:
+        pass
+    return None
+
+def _normalize_rows(rows: List[List[Any]]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {'rows': rows}
+    scalar = _to_scalar(rows)
+    if scalar is not None:
+        payload['value'] = scalar
+    return payload
 
 def _run_query(sql: str) -> str:
     """
-    Executa a query no DuckDB e retorna JSON.
-    Se detectar o binder error da view, recria a view e tenta 1x novamente.
+    Executa a query no DuckDB e retorna **sempre** JSON no formato:
+      {"rows": [[...], ...], "value": <x>}   # 'value' só quando 1x1
+    Faz 1 retry se detectar binder error da view.
     """
     sql = _normalize_from_dados(sql)
     for attempt in (1, 2):  # 1ª tentativa + 1 retry
         try:
-            logging.info(f'[Especialista] Executando query DuckDB (tentativa {attempt}): {sql}')
-            result = con.execute(sql).fetchall()
-            return json.dumps(result)
+            logging.info(f'[Especialista] Executando query DuckDB (tentativa {attempt}).')
+            rows = con.execute(sql).fetchall()  # nada de print/show/st.write
+            payload = _normalize_rows(rows)
+            return json.dumps(payload, ensure_ascii=False)
         except Exception as e:
             msg = str(e)
             logging.error(f'Erro na query DuckDB: {msg}')
@@ -109,9 +197,7 @@ def _run_query(sql: str) -> str:
                 except Exception as ee:
                     logging.error(f'Erro ao recriar VIEW: {ee}')
             # se não era o binder error, ou já tentamos o retry, retorna erro
-            return json.dumps({'error': msg})
-
-
+            return json.dumps({'error': msg}, ensure_ascii=False)
 
 # =========================================
 # 1) FUNÇÕES ESPECIALISTAS (rápidas e confiáveis)
